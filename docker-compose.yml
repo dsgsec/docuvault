@@ -1,0 +1,63 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: docuvault
+      POSTGRES_USER: docuvault
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-docuvault-password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docuvault -d docuvault"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./backend
+    environment:
+      DB_HOST: db
+      POSTGRES_DB: docuvault
+      POSTGRES_USER: docuvault
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-docuvault-password}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      FILE_STORAGE_PATH: /var/lib/docuvault/files
+      SEED_DEMO: ${SEED_DEMO:-true}
+    volumes:
+      - document_files:/var/lib/docuvault/files
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks:
+      - internal
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./frontend
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - internal
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  document_files:
+
+networks:
+  internal:
+    driver: bridge
