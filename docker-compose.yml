@@ -24,6 +24,8 @@ services:
       POSTGRES_DB: docuvault
       POSTGRES_USER: docuvault
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-docuvault-password}
+      APP_ENV: ${APP_ENV:-development}
+      AUDIT_PSEUDONYM_KEY: ${AUDIT_PSEUDONYM_KEY:-local-development-audit-pseudonym-key}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       FILE_STORAGE_PATH: /var/lib/docuvault/files
       SEED_DEMO: ${SEED_DEMO:-true}

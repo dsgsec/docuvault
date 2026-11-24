@@ -918,6 +918,33 @@ def list_documents(organization_id: str, request: Request, user: CurrentUser, db
     return {"documents": [document_view(db, document, user) for document in visible]}
 
 
+def reject_upload(
+    db: Session,
+    request: Request,
+    user: User,
+    organization_id: str,
+    detail: str,
+    reason: str,
+    status_code: int,
+    file_size: int | None = None,
+):
+    limited = status_code == 413
+    audit(
+        db, request,
+        "api.upload.limit_exceeded" if limited else "document.upload.rejected",
+        "denied", actor_id=user.id, organization_id=organization_id,
+        target_type="document", actor_organization_id=organization_id,
+        context={
+            "reason": reason,
+            "file_size": file_size,
+            "limit_bytes": MAX_UPLOAD_SIZE if limited else None,
+        },
+        status_code=status_code,
+    )
+    db.commit()
+    raise HTTPException(status_code=status_code, detail=detail)
+
+
 @app.post("/organizations/{organization_id}/documents", status_code=201)
 async def upload_document(
     organization_id: str, request: Request, user: CurrentUser, db: Db,
@@ -926,24 +953,32 @@ async def upload_document(
     require_membership(db, organization_id, user, request)
     title = title.strip() or Path(file.filename or "document").stem[:200]
     if len(title) > 200 or len(description) > 4000:
-        raise HTTPException(status_code=422, detail="Métadonnées trop longues")
+        reject_upload(db, request, user, organization_id, "Métadonnées trop longues", "metadata_too_long", 422)
     suffix = Path(file.filename or "").suffix.lower()
     expected = ALLOWED_TYPES.get(suffix)
     if not expected:
-        raise HTTPException(status_code=415, detail="Format accepté : PDF, TXT, PNG ou JPEG")
+        reject_upload(db, request, user, organization_id, "Format accepté : PDF, TXT, PNG ou JPEG", "unsupported_type", 415)
     content = await file.read(MAX_UPLOAD_SIZE + 1)
     if not content:
-        raise HTTPException(status_code=400, detail="Le fichier est vide")
+        reject_upload(db, request, user, organization_id, "Le fichier est vide", "empty_file", 400, 0)
     if len(content) > MAX_UPLOAD_SIZE:
-        raise HTTPException(status_code=413, detail="Taille maximale : 15 Mo")
+        reject_upload(db, request, user, organization_id, "Taille maximale : 15 Mo", "file_size_limit", 413, len(content))
     expected_type, signature = expected
     if signature and not content.startswith(signature):
-        raise HTTPException(status_code=415, detail="Le contenu du fichier ne correspond pas à son extension")
+        reject_upload(
+            db, request, user, organization_id,
+            "Le contenu du fichier ne correspond pas à son extension",
+            "content_signature_mismatch", 415, len(content),
+        )
     if suffix == ".txt":
         try:
             content.decode("utf-8")
         except UnicodeDecodeError:
-            raise HTTPException(status_code=415, detail="Le fichier texte doit être encodé en UTF-8")
+            reject_upload(
+                db, request, user, organization_id,
+                "Le fichier texte doit être encodé en UTF-8",
+                "invalid_text_encoding", 415, len(content),
+            )
     storage_key = f"{uuid.uuid4()}{suffix}"
     target = FILE_ROOT / storage_key
     target.write_bytes(content)
@@ -954,7 +989,14 @@ async def upload_document(
         content_type=expected_type, size=len(content),
     )
     db.add(document)
-    audit(db, request, "document.create", "success", user.id, organization_id, document.id)
+    audit(
+        db, request, "document.uploaded", "success",
+        user.id, organization_id, document.id,
+        target_type="document", target_id=document.id,
+        actor_organization_id=organization_id,
+        context={"file_size": len(content), "content_type": expected_type},
+        status_code=201,
+    )
     db.commit()
     return document_view(db, document, user)
 
@@ -962,7 +1004,12 @@ async def upload_document(
 @app.get("/documents/{document_id}")
 def get_document(document_id: str, request: Request, user: CurrentUser, db: Db):
     document = require_document(db, document_id, user, request)
-    audit(db, request, "document.view", "success", user.id, document.organization_id, document.id)
+    audit(
+        db, request, "document.viewed", "success",
+        user.id, document.organization_id, document.id,
+        target_type="document", target_id=document.id,
+        actor_organization_id=document.organization_id,
+    )
     db.commit()
     return document_view(db, document, user)
 
@@ -973,7 +1020,12 @@ def update_document(document_id: str, body: DocumentInput, request: Request, use
     document.title = body.title.strip()
     document.description = body.description.strip()
     document.updated_at = utcnow()
-    audit(db, request, "document.update", "success", user.id, document.organization_id, document.id)
+    audit(
+        db, request, "document.updated", "success",
+        user.id, document.organization_id, document.id,
+        target_type="document", target_id=document.id,
+        actor_organization_id=document.organization_id,
+    )
     db.commit()
     return document_view(db, document, user)
 
@@ -983,8 +1035,22 @@ def download_document(document_id: str, request: Request, user: CurrentUser, db:
     document = require_document(db, document_id, user, request)
     path = (FILE_ROOT / document.storage_key).resolve()
     if path.parent != FILE_ROOT or not path.is_file():
+        audit(
+            db, request, "access.resource_not_found", "error",
+            actor_id=user.id, organization_id=document.organization_id,
+            resource_id=document.id, target_type="document",
+            actor_organization_id=document.organization_id,
+            context={"reason": "stored_file_missing"}, status_code=404,
+        )
+        db.commit()
         raise HTTPException(status_code=404, detail="Fichier introuvable")
-    audit(db, request, "document.download", "success", user.id, document.organization_id, document.id)
+    audit(
+        db, request, "document.downloaded", "success",
+        user.id, document.organization_id, document.id,
+        target_type="document", target_id=document.id,
+        actor_organization_id=document.organization_id,
+        context={"file_size": document.size},
+    )
     db.commit()
     safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", document.original_name) or "document"
     return FileResponse(
@@ -998,11 +1064,25 @@ def delete_document(document_id: str, request: Request, user: CurrentUser, db: D
     document = require_document(db, document_id, user, request)
     membership = require_membership(db, document.organization_id, user, request)
     if document.owner_id != user.id and membership.role not in ("owner", "admin"):
+        audit(
+            db, request, "access.role_denied", "denied",
+            actor_id=user.id, organization_id=document.organization_id,
+            resource_id=document.id, target_type="document",
+            actor_organization_id=document.organization_id,
+            context={"reason": "document_owner_or_admin_required"},
+            status_code=403,
+        )
+        db.commit()
         raise HTTPException(status_code=403, detail="Seul le propriétaire ou un administrateur peut supprimer ce document")
     path = FILE_ROOT / document.storage_key
     db.query(DocumentShare).filter(DocumentShare.document_id == document.id).delete()
     db.delete(document)
-    audit(db, request, "document.delete", "success", user.id, document.organization_id, document.id)
+    audit(
+        db, request, "document.deleted", "success",
+        user.id, document.organization_id, document.id,
+        target_type="document", target_id=document.id,
+        actor_organization_id=document.organization_id,
+    )
     db.commit()
     path.unlink(missing_ok=True)
     return {"status": "ok"}
@@ -1030,11 +1110,29 @@ def set_share(document_id: str, body: ShareInput, request: Request, user: Curren
         Membership.organization_id == document.organization_id,
         Membership.user_id == body.user_id,
     ))
-    if not member or body.user_id == document.owner_id:
+    if not member:
+        audit(
+            db, request, "sharing.external_attempt", "denied",
+            actor_id=user.id, organization_id=document.organization_id,
+            resource_id=document.id, target_type="document",
+            actor_organization_id=document.organization_id,
+            context={
+                "reason": "recipient_not_in_organization",
+                "recipient_id": body.user_id,
+                "requested_permission": body.permission,
+            },
+            status_code=404,
+        )
+        db.commit()
+        raise HTTPException(status_code=404, detail="Membre introuvable")
+    if body.user_id == document.owner_id:
         raise HTTPException(status_code=404, detail="Membre introuvable")
     share = db.scalar(select(DocumentShare).where(
         DocumentShare.document_id == document.id, DocumentShare.user_id == body.user_id,
     ))
+    previous_permission = share.permission if share else None
+    if previous_permission == body.permission:
+        return {"status": "ok"}
     if share:
         share.permission = body.permission
     else:
@@ -1043,7 +1141,17 @@ def set_share(document_id: str, body: ShareInput, request: Request, user: Curren
             permission=body.permission,
         )
         db.add(share)
-    audit(db, request, "document.share.update", "success", user.id, document.organization_id, document.id)
+    audit(
+        db, request, "sharing.updated" if previous_permission else "sharing.created",
+        "success", user.id, document.organization_id, document.id,
+        target_type="document", target_id=document.id,
+        actor_organization_id=document.organization_id,
+        context={
+            "recipient_id": body.user_id,
+            "old_permission": previous_permission,
+            "new_permission": body.permission,
+        },
+    )
     db.commit()
     return {"status": "ok"}
 
@@ -1056,8 +1164,15 @@ def remove_share(document_id: str, member_id: str, request: Request, user: Curre
     ))
     if not share:
         raise HTTPException(status_code=404, detail="Partage introuvable")
+    previous_permission = share.permission
     db.delete(share)
-    audit(db, request, "document.share.remove", "success", user.id, document.organization_id, document.id)
+    audit(
+        db, request, "sharing.revoked", "success",
+        user.id, document.organization_id, document.id,
+        target_type="document", target_id=document.id,
+        actor_organization_id=document.organization_id,
+        context={"recipient_id": member_id, "old_permission": previous_permission},
+    )
     db.commit()
     return {"status": "ok"}
 
